@@ -5,7 +5,7 @@
 
 using namespace std;
 
-void scatterMatrix(const vector<vector<double>>& matrix, vector<vector<double>>& local_matrix, int N, int rank, int size);
+void scatterMatrix(vector<vector<double>>& local_matrix, int N, int rank, int size);
 void gatherMatrix(vector<vector<double>>& local_matrix, vector<vector<double>>& matrix, int N, int rank, int size);
 void gaussianElimination(vector<vector<double>>& local_matrix, int N, int rank, int size);
 
@@ -18,12 +18,11 @@ int main(int argc, char** argv) {
 
     int N;
     vector<vector<double>> matrix;
-    vector<vector<double>> local_matrix;
-
-    // Get input 
+    //Input
     if (rank == 0) {
         cin >> N;
         matrix.resize(N, vector<double>(N));
+
         for (int i = 0; i < N; ++i) {
             for (int j = 0; j < N; ++j) {
                 cin >> matrix[i][j];
@@ -34,11 +33,19 @@ int main(int argc, char** argv) {
     // Broadcast the matrix size to all processes
     MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
+    // Calculate rows per process and the start and end indices
+    int rows_per_process = N / size;
+    int extra_rows = N % size;
+
+    int local_rows = rows_per_process + (rank < extra_rows ? 1 : 0);
+    int start_row = rank * rows_per_process + min(rank, extra_rows);
+    int end_row = start_row + local_rows;
+
     // Resize the local matrix
-    local_matrix.resize(N / size, vector<double>(N * 2));
+    vector<vector<double>> local_matrix(local_rows, vector<double>(2 * N));
 
     // Scatter the rows of the matrix to all processes
-    scatterMatrix(matrix, local_matrix, N, rank, size);
+    scatterMatrix(local_matrix, N, rank, size);
 
     // Perform Gaussian elimination on the local matrix
     gaussianElimination(local_matrix, N, rank, size);
@@ -47,7 +54,6 @@ int main(int argc, char** argv) {
     gatherMatrix(local_matrix, matrix, N, rank, size);
 
     if (rank == 0) {
-        // Output the inverse matrix
         for (int i = 0; i < N; ++i) {
             for (int j = 0; j < N; ++j) {
                 cout << fixed << setprecision(2) << matrix[i][j] << " ";
@@ -60,79 +66,95 @@ int main(int argc, char** argv) {
     return 0;
 }
 
-void scatterMatrix(const vector<vector<double>>& matrix, vector<vector<double>>& local_matrix, int N, int rank, int size) {
-    vector<double> send_buffer(N * N * 2);
-    vector<double> recv_buffer((N * N * 2) / size);
+void scatterMatrix(vector<vector<double>>& local_matrix, int N, int rank, int size) {
+    vector<int> sendcounts(size);
+    vector<int> displs(size);
 
+    int rows_per_proc = N / size;
+    int remainder = N % size;
+
+    for (int i = 0; i < size; ++i) {
+        sendcounts[i] = (rows_per_proc + (i < remainder ? 1 : 0)) * N * 2;
+        displs[i] = (i == 0 ? 0 : displs[i - 1] + sendcounts[i - 1]);
+    }
+
+    vector<double> sendbuf;
     if (rank == 0) {
+        sendbuf.resize(N * N * 2);
         for (int i = 0; i < N; ++i) {
             for (int j = 0; j < N; ++j) {
-                send_buffer[i * N * 2 + j] = matrix[i][j];
-                send_buffer[i * N * 2 + N + j] = (i == j) ? 1.0 : 0.0;  // Augment with identity matrix
+                sendbuf[i * N * 2 + j] = local_matrix[i][j];
+                sendbuf[i * N * 2 + N + j] = (i == j) ? 1.0 : 0.0;  // Augment with identity matrix
             }
         }
     }
 
-    MPI_Scatter(send_buffer.data(), (N * N * 2) / size, MPI_DOUBLE, recv_buffer.data(), (N * N * 2) / size, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    vector<double> recvbuf(sendcounts[rank]);
+    MPI_Scatterv(sendbuf.data(), sendcounts.data(), displs.data(), MPI_DOUBLE, recvbuf.data(), recvbuf.size(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-    for (int i = 0; i < N / size; ++i) {
-        for (int j = 0; j < N * 2; ++j) {
-            local_matrix[i][j] = recv_buffer[i * N * 2 + j];
+    int local_rows = recvbuf.size() / (2 * N);
+    for (int i = 0; i < local_rows; ++i) {
+        for (int j = 0; j < 2 * N; ++j) {
+            local_matrix[i][j] = recvbuf[i * 2 * N + j];
         }
     }
 }
 
 void gatherMatrix(vector<vector<double>>& local_matrix, vector<vector<double>>& matrix, int N, int rank, int size) {
-    vector<double> send_buffer((N * N * 2) / size);
-    vector<double> recv_buffer(N * N * 2);
+    vector<int> recvcounts(size);
+    vector<int> displs(size);
 
-    for (int i = 0; i < N / size; ++i) {
-        for (int j = 0; j < N * 2; ++j) {
-            send_buffer[i * N * 2 + j] = local_matrix[i][j];
+    int rows_per_proc = N / size;
+    int remainder = N % size;
+
+    for (int i = 0; i < size; ++i) {
+        recvcounts[i] = (rows_per_proc + (i < remainder ? 1 : 0)) * N;
+        displs[i] = (i == 0 ? 0 : displs[i - 1] + recvcounts[i - 1]);
+    }
+
+    vector<double> sendbuf(local_matrix.size() * N);
+    vector<double> recvbuf(N * N);
+
+    for (int i = 0; i < local_matrix.size(); ++i) {
+        for (int j = 0; j < N; ++j) {
+            sendbuf[i * N + j] = local_matrix[i][N + j];  // Extract inverse matrix part
         }
     }
 
-    MPI_Gather(send_buffer.data(), (N * N * 2) / size, MPI_DOUBLE, recv_buffer.data(), (N * N * 2) / size, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Gatherv(sendbuf.data(), sendbuf.size(), MPI_DOUBLE, recvbuf.data(), recvcounts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
         for (int i = 0; i < N; ++i) {
             for (int j = 0; j < N; ++j) {
-                matrix[i][j] = recv_buffer[i * N * 2 + N + j];  // Extract inverse matrix from augmented matrix
+                matrix[i][j] = recvbuf[i * N + j];
             }
         }
     }
 }
 
 void gaussianElimination(vector<vector<double>>& local_matrix, int N, int rank, int size) {
+    int local_rows = local_matrix.size();
+    vector<double> pivot_row(2 * N);
+
     for (int k = 0; k < N; ++k) {
-        int owner = k / (N / size);  // Determine which process owns the current row
+        int owner = k / (N / size + (k % size < N % size ? 1 : 0));  // Determine which process owns the current row
 
         if (rank == owner) {
-            int local_row = k % (N / size);
-
-            // Normalize the pivot row
+            int local_row = k - (owner * (N / size) + min(owner, N % size));
             double pivot = local_matrix[local_row][k];
-            for (int j = 0; j < N * 2; ++j) {
+            for (int j = 0; j < 2 * N; ++j) {
                 local_matrix[local_row][j] /= pivot;
             }
+            pivot_row = local_matrix[local_row];
+        }
 
-            // Broadcast the normalized pivot row to all processes
-            MPI_Bcast(local_matrix[local_row].data(), N * 2, MPI_DOUBLE, rank, MPI_COMM_WORLD);
-        } else {
-            vector<double> pivot_row(N * 2);
-            MPI_Bcast(pivot_row.data(), N * 2, MPI_DOUBLE, owner, MPI_COMM_WORLD);
+        MPI_Bcast(pivot_row.data(), 2 * N, MPI_DOUBLE, owner, MPI_COMM_WORLD);
 
-            if (rank == owner) {
-                local_matrix[k % (N / size)] = pivot_row;
-            } else {
-                // Update the other rows
-                for (int i = 0; i < N / size; ++i) {
-                    if (k % size != i) {
-                        double factor = local_matrix[i][k];
-                        for (int j = 0; j < N * 2; ++j) {
-                            local_matrix[i][j] -= factor * pivot_row[j];
-                        }
-                    }
+        for (int i = 0; i < local_rows; ++i) {
+            if (local_matrix[i][k] != pivot_row[k]) {
+                double factor = local_matrix[i][k];
+                for (int j = 0; j < 2 * N; ++j) {
+                    local_matrix[i][j] -= factor * pivot_row[j];
                 }
             }
         }
